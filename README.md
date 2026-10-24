@@ -306,19 +306,7 @@ You can create the cluster through the AWS Management Console.
 Cluster creation can take several minutes. If the cluster fails to
 create, review the status and events in the EKS console before retrying.
 
-Or use following AWS CLI 
-``` bash
-aws eks create-cluster \
-  --region us-east-1 \
-  --name my-cluster \
-  --role-arn "$(aws iam get-role --role-name myAmazonEKSClusterRole --query 'Role.Arn' --output text)" \
-  --resources-vpc-config "$(aws cloudformation describe-stacks --region us-east-1 --stack-name my-eks-vpc-stack --query 'Stacks[0].Outputs' --output json | jq -c '{
-    subnetIds: [.[] | select(.OutputKey | test("Subnet.*Id"; "i")) | .OutputValue | split(",")[]] | unique,
-    securityGroupIds: [.[] | select(.OutputKey | test("ControlPlaneSecurityGroup"; "i")) | .OutputValue],
-    endpointPublicAccess: true,
-    endpointPrivateAccess: true
-  }')"
-```
+
 ## Step 6: Configure kubectl
 
 After the cluster status becomes `ACTIVE`, configure your local
