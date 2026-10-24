@@ -1,23 +1,16 @@
 # Amazon EKS Managed Node Group — User Guide
 
-This guide explains how to create a managed node group in an existing Amazon EKS cluster using `eksctl`.
+This guide creates an IAM node role and uses it to create a managed node group in an existing Amazon EKS cluster with `eksctl`.
 
 ## 1. Prerequisites
 
-Install and configure the following tools:
+Install and configure:
 
 - [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
 - [kubectl](https://kubernetes.io/docs/tasks/tools/)
 - [eksctl](https://eksctl.io/installation/)
 
-You also need:
-
-- An existing EKS cluster in `ACTIVE` status.
-- An IAM node role with the required EKS worker-node permissions.
-- Subnets and networking configured so worker nodes can reach the EKS API endpoint.
-- AWS credentials with permission to create and manage node groups and related resources.
-
-Check tool versions and AWS access:
+Check the tools and AWS identity:
 
 ```bash
 aws --version
@@ -26,9 +19,9 @@ eksctl version
 aws sts get-caller-identity
 ```
 
-The source guide requires `eksctl` version `0.215.0` or later.
+Use `eksctl` version `0.215.0` or later. You also need an existing EKS cluster in `ACTIVE` status and permissions to create IAM roles and EKS node groups.
 
-## 2. Set Your Cluster Details
+## 2. Set Cluster Details
 
 Replace the example values with your own:
 
@@ -36,9 +29,10 @@ Replace the example values with your own:
 export CLUSTER_NAME="my-cluster"
 export AWS_REGION="us-east-1"
 export NODEGROUP_NAME="my-mng"
+export NODE_ROLE_NAME="EKSWorkerNodeRole"
 ```
 
-Confirm that the cluster exists and is active:
+Check that the cluster is active:
 
 ```bash
 aws eks describe-cluster \
@@ -48,13 +42,9 @@ aws eks describe-cluster \
   --output text
 ```
 
-Expected output:
+Expected output: `ACTIVE`
 
-```text
-ACTIVE
-```
-
-Configure `kubectl` to connect to the cluster:
+Configure `kubectl`:
 
 ```bash
 aws eks update-kubeconfig \
@@ -62,28 +52,109 @@ aws eks update-kubeconfig \
   --region "$AWS_REGION"
 ```
 
-## 3. Create the Managed Node Group
+## 3. Create the EKS Node IAM Role
 
-Create a basic managed node group with three `m5.large` instances:
+Worker nodes need an IAM role to communicate with EKS and pull images from ECR. This is separate from the IAM role used to create the EKS cluster.
+
+Create the EC2 trust policy:
 
 ```bash
-eksctl create nodegroup \
-  --cluster "$CLUSTER_NAME" \
-  --region "$AWS_REGION" \
-  --name "$NODEGROUP_NAME" \
-  --node-type m5.large \
-  --nodes 3 \
-  --nodes-min 2 \
-  --nodes-max 4
+cat > node-trust-policy.json <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ec2.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
 ```
 
-This example maintains three nodes initially, with a configured minimum of two and maximum of four. Choose an instance type and scaling limits suitable for your workload and budget.
+Create the role:
 
-If you need a custom AMI or additional instance configuration, use an appropriately configured EC2 launch template. Decide whether to use a launch template when creating the node group; do not switch an existing node group from an automatically generated template to a custom one later.
+```bash
+aws iam create-role \
+  --role-name "$NODE_ROLE_NAME" \
+  --assume-role-policy-document file://node-trust-policy.json
+```
 
-## 4. Verify the Nodes
+Attach the standard managed-node-group policies:
 
-Wait for the node group to finish creating, then check its status:
+```bash
+aws iam attach-role-policy \
+  --role-name "$NODE_ROLE_NAME" \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+
+aws iam attach-role-policy \
+  --role-name "$NODE_ROLE_NAME" \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly
+```
+
+If your nodes pull images from **Amazon ECR Public**, optionally attach this policy to avoid public-image pull throttling:
+
+```bash
+aws iam attach-role-policy \
+  --role-name "$NODE_ROLE_NAME" \
+  --policy-arn arn:aws:iam::aws:policy/AmazonElasticContainerRegistryPublicReadOnly
+```
+
+**Policy note:** `AmazonEKSWorkerNodeMinimalPolicy` is intended for **EKS Auto Mode** node roles, where it is used with `AmazonEC2ContainerRegistryPullOnly`. For this guide's standard managed node group, use `AmazonEKSWorkerNodePolicy` with `AmazonEC2ContainerRegistryPullOnly`; do not attach both worker-node policies by default. The VPC CNI also needs its own permissions, preferably through a separate IAM role associated with the `aws-node` service account. See the [AWS node IAM role guide](https://docs.aws.amazon.com/eks/latest/userguide/create-node-role.html).
+
+Get the role ARN:
+
+```bash
+export NODE_ROLE_ARN=$(aws iam get-role \
+  --role-name "$NODE_ROLE_NAME" \
+  --query 'Role.Arn' \
+  --output text)
+
+echo "$NODE_ROLE_ARN"
+```
+
+**VPC CNI note:** For IPv4 clusters, `AmazonEKS_CNI_Policy` must be available to the VPC CNI. AWS recommends assigning it to a separate IAM role associated with the `aws-node` service account using IRSA or EKS Pod Identity. Attach it to the node role only if your CNI permissions are not provided separately. IPv6 clusters require an appropriate IPv6 CNI policy.
+
+Official reference: [Amazon EKS node IAM role](https://docs.aws.amazon.com/eks/latest/userguide/create-node-role.html).
+
+## 4. Create a Managed Node Group Using That Role
+
+Create an `eksctl` configuration file that explicitly references the role ARN:
+
+```bash
+cat > eks-nodegroup.yaml <<EOF
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: ${CLUSTER_NAME}
+  region: ${AWS_REGION}
+
+managedNodeGroups:
+  - name: ${NODEGROUP_NAME}
+    instanceType: m5.large
+    desiredCapacity: 3
+    minSize: 2
+    maxSize: 4
+    iam:
+      instanceRoleARN: ${NODE_ROLE_ARN}
+EOF
+```
+
+Create the node group:
+
+```bash
+eksctl create nodegroup --config-file eks-nodegroup.yaml
+```
+
+The example starts with three `m5.large` nodes and allows the group size to range from two to four. Adjust the instance type and capacity to suit your workload and budget.
+
+## 5. Verify the Nodes
+
+Check the node group:
 
 ```bash
 eksctl get nodegroup \
@@ -95,29 +166,24 @@ Check Kubernetes nodes:
 
 ```bash
 kubectl get nodes -o wide
-```
-
-Wait for nodes to become ready:
-
-```bash
 kubectl get nodes --watch
 ```
 
-All expected worker nodes should eventually show `Ready`.
+Wait until the expected nodes show `Ready`.
 
-## 5. Troubleshooting
+## 6. Troubleshooting
 
 If nodes do not join the cluster, check:
 
-- The node IAM role and its required permissions.
+- The node role trust policy and attached policies.
 - Subnet routing, security groups, DNS, and connectivity to the EKS API endpoint.
-- The node group status and associated Auto Scaling group in the AWS console.
+- Node group status and EC2 Auto Scaling activity.
 
 See the [official EKS troubleshooting guide](https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html#worker-node-fail).
 
-## 6. Clean Up Learning Resources
+## 7. Clean Up
 
-Managed nodes are EC2 instances and incur charges while running. Delete the node group when you no longer need it:
+Managed node groups use EC2 instances and incur charges. Delete the node group when you finish learning:
 
 ```bash
 eksctl delete nodegroup \
@@ -126,18 +192,26 @@ eksctl delete nodegroup \
   --name "$NODEGROUP_NAME"
 ```
 
-Verify that the node group has been removed:
+This removes the node group, not the EKS cluster. Delete the IAM role separately only after confirming it is not used by another node group:
 
 ```bash
-eksctl get nodegroup \
-  --cluster "$CLUSTER_NAME" \
-  --region "$AWS_REGION"
-```
+aws iam detach-role-policy \
+  --role-name "$NODE_ROLE_NAME" \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
 
-**Note:** This deletes the node group, not the EKS cluster itself. Review any workloads and storage before cleanup.
+aws iam detach-role-policy \
+  --role-name "$NODE_ROLE_NAME" \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly
+
+# Run this too only if you attached the optional ECR Public policy:
+aws iam detach-role-policy \
+  --role-name "$NODE_ROLE_NAME" \
+  --policy-arn arn:aws:iam::aws:policy/AmazonElasticContainerRegistryPublicReadOnly
+
+aws iam delete-role --role-name "$NODE_ROLE_NAME"
+```
 
 ## References
 
-- [Create a managed node group with EKS](https://docs.aws.amazon.com/eks/latest/userguide/create-managed-node-group.html)
+- [Create a managed node group](https://docs.aws.amazon.com/eks/latest/userguide/create-managed-node-group.html)
 - [Amazon EKS node IAM role](https://docs.aws.amazon.com/eks/latest/userguide/create-node-role.html)
-- [Choose an EC2 instance type](https://docs.aws.amazon.com/eks/latest/userguide/choosing-instance-type.html)
