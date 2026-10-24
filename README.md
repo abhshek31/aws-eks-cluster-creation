@@ -312,20 +312,12 @@ aws eks create-cluster \
   --region us-east-1 \
   --name my-cluster \
   --role-arn "$(aws iam get-role --role-name myAmazonEKSClusterRole --query 'Role.Arn' --output text)" \
-  --resources-vpc-config "$(
-    aws cloudformation describe-stacks \
-      --region us-east-1 \
-      --stack-name my-eks-vpc-stack \
-      --query 'Stacks[0].Outputs' \
-      --output json |
-    python3 -c '
-import json,sys
-o={x["OutputKey"]:x["OutputValue"] for x in json.load(sys.stdin)}
-vpc=o["VpcId"]
-subnets=[x["OutputValue"] for x in json.load(sys.stdin)] if False else []
-print("")
-' 
-  )"
+  --resources-vpc-config "$(aws cloudformation describe-stacks --region us-east-1 --stack-name my-eks-vpc-stack --query 'Stacks[0].Outputs' --output json | jq -c '{
+    subnetIds: [.[] | select(.OutputKey | test("Subnet.*Id"; "i")) | .OutputValue | split(",")[]] | unique,
+    securityGroupIds: [.[] | select(.OutputKey | test("ControlPlaneSecurityGroup"; "i")) | .OutputValue],
+    endpointPublicAccess: true,
+    endpointPrivateAccess: true
+  }')"
 ```
 ## Step 6: Configure kubectl
 
