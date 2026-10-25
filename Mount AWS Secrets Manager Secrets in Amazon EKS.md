@@ -1,7 +1,5 @@
 # Mount AWS Secrets Manager Secrets in Amazon EKS Using EKS Pod Identity
 
-This guide summarizes the AWS article [How to use the Secrets Store CSI Driver provider Amazon EKS add-on with Secrets Manager](https://aws.amazon.com/blogs/security/how-to-use-the-secrets-store-csi-driver-provider-amazon-eks-add-on-with-secrets-manager/) and uses the `Service` and `Deployment` manifest provided for this project.
-
 The solution retrieves a secret from **AWS Secrets Manager** and mounts it as a file inside an NGINX pod using the **AWS Secrets Store CSI Driver provider** and **EKS Pod Identity**.
 
 ## How it works
